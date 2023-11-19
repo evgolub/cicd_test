@@ -1,0 +1,222 @@
+---
+- name: cicd_test
+  hosts: localhost
+  become: true
+  tasks:
+
+    - name: install dependencies
+      apt:
+        name: "{{item}}"
+        state: present
+        update_cache: yes
+      loop:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg-agent
+        - software-properties-common
+        - pip
+
+    - name: add GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: add docker repository to apt
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu bionic stable
+        state: present
+
+    - name: install Docker
+      apt:
+        name: "{{item}}"
+        state: latest
+        update_cache: yes
+      loop:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+
+    - name: Install Docker Module for Python
+      pip:
+        name: docker
+
+    - name: Create Docker test_network
+      docker_network:
+        name: test_network
+        ipam_config:
+          - subnet: 172.18.0.0/16
+            gateway: 172.18.0.1
+
+    - name: Start Jenkins Docker container
+      docker_container:
+        name: jenkins
+        image: jenkins/jenkins
+        state: started
+        restart_policy: always
+        ports:
+          - "127.0.0.1:8080:8080"
+        networks:
+        - name: test_network
+          ipv4_address: 172.18.0.10
+        volumes:
+          - "{{ playbook_dir }}/jenkins_home:/var/jenkins_home"
+        env:
+          JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+          JENKINS_OPTS: "--argumentsRealm.roles.user=admin"
+        user: root
+        command: /bin/bash -c 'apt-get update && apt-get install -y maven && apt-get install wget && /usr/local/bin/jenkins.sh'
+
+    - name: make dir 
+      command: mkdir -p {{ playbook_dir }}/nexus-data/etc
+
+    - name: change chmod dir
+      command: chown -R 200 {{ playbook_dir }}/nexus-data
+
+    - name: start Nexus Docker container
+      docker_container:
+        name: nexus
+        image: sonatype/nexus3
+        state: started
+        restart_policy: always
+        ports:
+          - "127.0.0.1:8081:8081"
+        networks:
+        - name: test_network
+          ipv4_address: 172.18.0.20
+        volumes:
+          - "{{ playbook_dir }}/nexus-data:/nexus-data"
+
+    - name: wait admin.password file - Nexus
+      ansible.builtin.wait_for:
+        path: "{{ playbook_dir }}/nexus-data/admin.password"
+        timeout: 600
+      register: wait_result
+
+    - name: Nexus Check file admin.password
+      debug:
+        msg: "The admin.password file is now available."
+      when: wait_result.elapsed < 300
+
+    - name: Nexus Read file admin.password
+      ansible.builtin.slurp:
+        src: "{{ playbook_dir }}/nexus-data/admin.password"
+      register: adpass
+
+    - name: adpass in a variable
+      set_fact:
+        adpassword: "{{ adpass.content | b64decode }}"
+
+    - debug:
+        var: adpassword
+
+    - name: Check Nexus OSS status
+      command: >
+        curl -Il 'http://127.0.0.1:8081/service/rest/v1/status/check'
+        -u 'admin:{{ adpassword }}'
+      register: result
+      until: result.stdout.find("200 OK") != -1
+      retries: 60
+      delay: 5
+
+    - name: Update user
+      command: >
+        curl -X PUT -u admin:{{ adpassword }}
+        http://127.0.0.1:8081/service/rest/v1/security/users/anonymous
+        -H 'accept: application/json'
+        -H 'Content-Type: application/json'
+        -H 'NX-ANTI-CSRF-TOKEN: 0.18231096721569262'
+        -H 'X-Nexus-UI: true'
+        -d '{
+          "userId": "anonymous",
+          "firstName": "Anonymous",
+          "lastName": "User",
+          "emailAddress": "anonymous@example.org",
+          "source": "default",
+          "status": "active",
+          "readOnly": false,
+          "roles": ["nx-admin"],
+          "externalRoles": []
+        }'
+      register: curl_output
+
+    - debug:
+        var: curl_output.stdout_lines
+
+    - name: Wait untils Jenkins API is available
+      shell: curl --head --silent http://127.0.0.1:8080/cli/
+      register: result
+      until: result.stdout.find("200 OK") != -1
+      retries: 60
+      delay: 5
+
+    - name: Jenkins wget jenkins-cli.jar
+      command: docker exec -u root jenkins sh -c 'wget http://localhost:8080/jnlpJars/jenkins-cli.jar -O /usr/bin/jenkins-cli.jar' && wait
+
+    - name: Jenkins intall plugins
+      command: docker exec -u root jenkins sh -c 'java -jar /usr/bin/jenkins-cli.jar -s http://localhost:8080/ install-plugin git nexus-artifact-uploader maven-plugin' && wait
+      register: command_result
+      retries: 5
+      delay: 10
+      until: command_result.rc == 0
+      ignore_errors: yes
+
+    - name: Jenkins safe-restart
+      command: docker exec -u root jenkins sh -c 'java -jar /usr/bin/jenkins-cli.jar -s http://localhost:8080/ safe-restart' && wait
+
+    - name: Start Nginx Docker container
+      docker_container:
+        name: nginx
+        image: nginx
+        state: started
+        restart_policy: always
+        ports:
+          - "127.0.0.10:443:443"
+          - "127.0.0.20:443:8443"
+        networks:
+        - name: test_network
+          ipv4_address: 172.18.0.30
+
+    - name: Nginx create folder ssl
+      command: docker exec -u root nginx sh -c 'mkdir -p /etc/nginx/ssl/' && wait
+
+    - name: Nginx copy crt
+      command: docker cp {{ playbook_dir }}/files/nginx/ssl/yourdomain.com.crt  nginx:/etc/nginx/ssl/yourdomain.com.crt
+
+    - name: Nginx copy key
+      command: docker cp {{ playbook_dir }}/files/nginx/ssl/yourdomain.com.key  nginx:/etc/nginx/ssl/yourdomain.com.key
+
+    - name: Nginx copy nginx.conf.
+      command: docker cp {{ playbook_dir }}/files/nginx/nginx.conf  nginx:/etc/nginx/conf.d/nginx.conf
+
+    - name: Nginx reload
+      command: docker exec -u root nginx sh -c 'service nginx reload' && wait
+      ignore_errors: yes
+
+    - name: Wait untils Jenkins web API is available
+      shell: curl --head --silent http://127.0.0.1:8080/cli/
+      register: result
+      until: result.stdout.find("200 OK") != -1
+      retries: 60
+      delay: 5
+
+    - name: Copy job cfg to Jenkins Home
+      command: docker cp {{ playbook_dir }}/files/jenkins/config.xml jenkins:var/jenkins_home/job_config.xml
+
+    - name: Jenkins create job
+      command: docker exec -i jenkins sh -c 'java -jar /usr/bin/jenkins-cli.jar -s http://localhost:8080/ create-job job_test_job < var/jenkins_home/job_config.xml' && wait
+
+    - name: Jenkins start job
+      command: docker exec -i jenkins sh -c 'java -jar /usr/bin/jenkins-cli.jar -s http://localhost:8080/ build job_test_job' && wait
+
+    - name: Add jenkins.example.com to /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "127.0.0.10	jenkins.example.com"
+        state: present
+
+    - name: Add nexus.example.com to /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "127.0.0.20	nexus.example.com"
+        state: present
